@@ -1,371 +1,587 @@
-#include "stm32f10x.h"                // Device header
-#include "SystemClockConfig.h"        // Custom clock config
-#include "DelayFunctions.h"           // Custom delay
-#include "stdio.h"                    // For prints if needed (not used here)
+#include "stm32f10x.h"
+#include "Clock_Config.h"
+#include "Delay_ms.h"
+#include "stdio.h"
 
-/* --- Global Variables for Line Sensor PID --- */
-static int8_t  g_lineData[8]     = {0};    // Store raw line sensor reads
-static int     g_linePos         = 0;      // Weighted line position
-static int     g_lineLastError   = 0;      // Last line error for derivative
-static int     g_lineErrorHist[10] = {0};  // Past errors for integral
-static float   g_lineKp  = 0.007f;         // Proportional gain (line)
-static float   g_lineKi  = 0.003f;         // Integral gain (line)
-static float   g_lineKd  = 100.0f;         // Derivative gain (line)
+/* ----------------- SR04 Pins on Port B (example) ----------------
+   Adjust PB12, PB13 to suit your wiring on the NUCLEO board.
+   TRIG = PB12  (output)
+   ECHO = PB13  (input)
+   --------------------------------------------------------------- */
+#define TRIG_PIN   12
+#define ECHO_PIN   13
 
-/* --- Global Variables for Distance PID --- */
-static float   g_distanceMeasured    = 0.0f;   // Measured distance (cm)
-static float   g_distanceSetpoint    = 60.0f;  // Desired distance (cm)
-static float   g_distanceError       = 0.0f;   // Current error
-static float   g_distanceLastError   = 0.0f;   // Last error for derivative
-static float   g_distanceErrorHist[10] = {0};  // Past distance errors for integral
-static float   g_distKp = 0.9f;               // Proportional gain (distance)
-static float   g_distKi = 0.05f;              // Integral gain (distance)
-static float   g_distKd = 0.2f;               // Derivative gain (distance)
+/* Desired distance from the board in centimeters */
+#define DESIRED_DISTANCE_CM  70.0f
 
-/* --- Motor Speeds & Limits --- */
-static int     g_baseSpeed      = 30;     // Base forward speed
-static int     g_motorMaxSpeed  = 100;    // Maximum motor speed (absolute value)
+/* Function Prototypes */
+void pwm (void);
+void pwm2 (void);
+void PID_control(void);
+void sensor_left (int Cl3,int Cl4);
+void sensor_right (int Cr3,int Cr4);
+//void sharp_turn(void);
+void Ultrasonic_Init(void);
+float getDistance(void);
 
-/* --- Misc Variables --- */
-static int     g_lineNoDetectCount = 0;   // Count cycles with no line
-static int     g_lineEndedLeft     = 0;   // 1 if line ended on left, 0 if ended on right
+/* Original data and sensor variables */
+int data[8] = { 0, 0, 0, 0, 0, 0, 0, 0};
+static int SensorData = 0x00000000;
+int position;
+float Kp = 0.015;  
+float Ki = 0.003;  
+float Kd = 10;   
+int P, I, D;
+int errors[10] = {0,0,0,0,0,0,0,0,0,0};
+int error_sum = 0;
 
-/* --- Function Prototypes --- */
-void initGPIO(void);                        
-void initPWM_Timer2(void);                 
-void initPWM_Timer3(void);                 
-void driveMotors(int left, int right);     
-int  readLineSensors(void);                
-void shiftLineErrorHistory(int error);     
-int  sumLineErrors(int count);             
-void updateLinePID(int *pLeftOut, int *pRightOut);
+/* ---------------- Adjusted from const to normal globals ---------- */
+uint8_t maxspeedr = 100;
+uint8_t maxspeedl = 100;
+uint8_t basespeedr = 50;
+uint8_t basespeedl = 50;
+/* ------------------------------------------------------------------ */
 
-void shiftDistErrorHistory(float error);   
-float sumDistErrors(int count);            
-float updateDistancePID(void);
+const int ARR_const = 13;
+int lastError = 0;
+int i;
+int k;
+int error;
+int motorspeed;
+int motorspeedl;
+int motorspeedr;
+int varan = 0;
+int actives = 0;
+int last_end = 0;
+int last_idle = 0;
 
-void handleNoLine(void);
-void initUltrasonic(void);
-float measureDistance(void);
-void buzzerControl(float dist);
-
-/* --- MAIN FUNCTION --- */
-int main(void)
-{
-  initSystemClock();                 // Configure system clock to ~72 MHz
-  initGPIO();                        // Configure all GPIO pins
-  initPWM_Timer2();                  // Configure PWM on Timer2 (PB0, PB1)
-  initPWM_Timer3();                  // Configure PWM on Timer3 (PB10, PB11)
-  initTimer2ForDelay();             // Re-init Timer2 for microsecond delay (educational example)
-  initUltrasonic();                  // Configure ultrasonic pins
-  
-  while(1)
-  {
-    /* --- 1) Measure distance and compute distance PID output --- */
-    g_distanceMeasured = measureDistance();         // Ultrasonic measurement
-    g_distanceError    = g_distanceSetpoint - g_distanceMeasured; // Distance error
-    float forwardPID   = updateDistancePID();       // Update distance PID => modifies forward speed
-    
-    int forwardSpeed = g_baseSpeed + (int)forwardPID; // Combine base speed + distance correction
-    if(forwardSpeed < -g_motorMaxSpeed) forwardSpeed = -g_motorMaxSpeed;
-    if(forwardSpeed >  g_motorMaxSpeed) forwardSpeed =  g_motorMaxSpeed;
-    
-    /* --- 2) Compute line sensor PID output (steering) --- */
-    // 'steering' will be subtracted from right motor and added to left motor
-    int steeringLeft  = 0;
-    int steeringRight = 0;
-    updateLinePID(&steeringLeft, &steeringRight);  // Compute line-based correction for left, right
-    
-    /* 
-       Combine forwardSpeed and line steering. 
-       
-    */
-    int finalLeftSpeed  = forwardSpeed + steeringLeft;
-    int finalRightSpeed = forwardSpeed + steeringRight;
-    
-    // Clamp final speeds
-    if(finalLeftSpeed  < -g_motorMaxSpeed) finalLeftSpeed  = -g_motorMaxSpeed;
-    if(finalLeftSpeed  >  g_motorMaxSpeed) finalLeftSpeed  =  g_motorMaxSpeed;
-    if(finalRightSpeed < -g_motorMaxSpeed) finalRightSpeed = -g_motorMaxSpeed;
-    if(finalRightSpeed >  g_motorMaxSpeed) finalRightSpeed =  g_motorMaxSpeed;
-    
-    /* --- 3) Drive motors and buzzer feedback --- */
-    driveMotors(finalLeftSpeed, finalRightSpeed);  // Send final commands to motors
-    buzzerControl(g_distanceMeasured);             // Buzzer logic
-  }
-  return 0; 
-}
-
-/* --- GPIO INIT --- */
+/* --------------------------- initGPIO --------------------------- */
 void initGPIO(void)
 {
-  RCC->APB2ENR |= (1<<2) | (1<<3) | (1<<0); // Enable clock for GPIOA, GPIOB, AFIO
+  RCC->APB2ENR |= RCC_APB2ENR_IOPAEN; // Enable port A clock
+  GPIOA->CRL &= ~(0xFFFFFFFF);
 
-  /* --- PB0, PB1 => Timer2 CH3, CH4 for PWM --- */
-  GPIOB->CRL &= ~((0xF<<(0*4)) | (0xF<<(1*4))); // Clear bits for PB0, PB1
-  GPIOB->CRL |=  ((0xB<<(0*4)) | (0xB<<(1*4))); // 0xB => 1011 => 50 MHz, AF PP
+  RCC->APB2ENR |= (1<<3); // GPIOB clock enable
 
-  /* --- PB10, PB11 => Timer3 CH3, CH4 for PWM --- */
-  GPIOB->CRH &= ~((0xF<<(2*4)) | (0xF<<(3*4))); // Clear bits for PB10, PB11
-  GPIOB->CRH |=  ((0xB<<(2*4)) | (0xB<<(3*4))); // 0xB => 1011 => 50 MHz, AF PP
-
-  /* --- PB8 => Buzzer output --- */
-  // PB8 in CRH => (8-8)*4=0 in CRH
-  GPIOB->CRH &= ~(0xF << (0*4));    
-  GPIOB->CRH |=  (0x3 << (0*4));    // 0x3 => 0011 => 50 MHz, GP Push-Pull
-
-  /* --- PB12 => TRIG (Output), PB13 => ECHO (Input PullUp) --- */
-  // PB12 => output push-pull
-  GPIOB->CRH &= ~(0xF << (4*4));   
-  GPIOB->CRH |=  (0x3 << (4*4));   // 0x3 => 0011 => 50 MHz, GP Push-Pull
-  // PB13 => input with pull-up => 0x8
-  GPIOB->CRH &= ~(0xF << (5*4));  
-  GPIOB->CRH |=  (0x8 << (5*4));   
-  GPIOB->ODR |=  (1<<13);         // Activate pull-up
-
-  /* --- PA0..PA7 => QTR8 line sensors => input pull-up --- */
-  for(int pin=0; pin<8; pin++)
-  {
-    GPIOA->CRL &= ~(0xF << (pin*4));   // Clear bits
-    GPIOA->CRL |=  (0x8 << (pin*4));   // 0x8 => 1000 => Input w/ pull-up
-  }
-  GPIOA->ODR |= 0xFF; // Pull all PA0..PA7 up
-}
-
-/* --- PWM INIT ON TIMER2 (PB0=CH3, PB1=CH4) --- */
-void initPWM_Timer2(void)
-{
-  RCC->APB1ENR |= (1<<0);        // Enable TIM2 clock
-  AFIO->MAPR   |= (3<<8);        // Full remap of TIM2 => PB0, PB1 => CH3, CH4
-  TIM2->PSC     = 72 - 1;        // Prescaler => 72 => Timer freq=1 MHz
-  TIM2->ARR     = 50000;         // Period => 50000 => ~20 Hz (example)
+  // PB0, PB1, PB10, PB"11 as alternate function push-pull (for PWM out)
+  // Make sure to configure them as needed for your hardware setup
+  GPIOB->CRL |=  ( (1<<0)|(1<<1)|(1<<3) ); // 50 MHz alt PP on PB0
+  GPIOB->CRL &= ~( (1<<2) );
   
-  // CH3 => OC3M=110 (PWM1 mode), OC3PE=1
-  TIM2->CCMR2 |= (6<<4) | (1<<3);  
-  // CH4 => OC4M=110, OC4PE=1
-  TIM2->CCMR2 |= (6<<12) | (1<<11);
-  // Enable CH3, CH4 outputs
-  TIM2->CCER  |= (1<<8) | (1<<12);
-  // ARPE=1
-  TIM2->CR1   |= (1<<7);
-  // Enable TIM2
-  TIM2->CR1   |= (1<<0);
-}
-
-/* --- PWM INIT ON TIMER3 (PB10=CH3, PB11=CH4) --- */
-void initPWM_Timer3(void)
-{
-  RCC->APB1ENR |= (1<<1);     // Enable TIM3 clock
-  TIM3->PSC     = 72 - 1;     // Prescaler => 72 => 1 MHz
-  TIM3->ARR     = 2000;       // Period => 2000 => 500 Hz (example)
+  GPIOB->CRL |=  ( (1<<4)|(1<<5)|(1<<7) );
+  GPIOB->CRL &= ~( (1<<6) );
   
-  // CH3 => OC3M=110 (PWM1), OC3PE=1
-  TIM3->CCMR2  |= (6<<4) | (1<<3);
-  // CH4 => OC4M=110 (PWM1), OC4PE=1
-  TIM3->CCMR2  |= (6<<12) | (1<<11);
-  // Enable CH3, CH4
-  TIM3->CCER   |= (1<<8) | (1<<12);
-  // ARPE=1
-  TIM3->CR1    |= (1<<7);
-  // Enable TIM3
-  TIM3->CR1    |= (1<<0);
+  GPIOB->CRH |=  ( (1<<8)|(1<<9)|(1<<11) );
+  GPIOB->CRH &= ~( (1<<10) );
+  
+  GPIOB->CRH |=  ( (1<<12)|(1<<13)|(1<<15) );
+  GPIOB->CRH &= ~( (1<<14) );
 }
 
-/* --- DRIVE MOTORS --- */
-void driveMotors(int left, int right)
+/* --------------------------- Buzzer_Init -------------------------
+   Configure PB8 as a push-pull output to drive an active buzzer.
+   If you have a passive buzzer, you’d need a PWM approach instead.
+   -------------------------------------------------------------- */
+void Buzzer_Init(void)
 {
-  /* 
-     PB0=TIM2_CH3, PB1=TIM2_CH4 => Left motor 
-     PB10=TIM3_CH3, PB11=TIM3_CH4 => Right motor
-     
-  */
-  if(left >= 0)
+  // PB8 lies in CRH (pins 8..15). For PB8, the configuration bits are CRH [3:0].
+  RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;  // Make sure Port B clock is enabled
+  // Clear the 4 bits for PB8, then set as 50 MHz, push-pull = 0x3
+  GPIOB->CRH &= ~(0xF << 0);  
+  GPIOB->CRH |=  (0x3 << 0);
+
+  // Initially buzzer off
+  GPIOB->BRR = (1 << 8);
+}
+
+/* --------------------------- Buzzer_On -------------------------- */
+void Buzzer_On(void)
+{
+  GPIOB->BSRR = (1 << 8); // Set PB8 High
+}
+
+/* --------------------------- Buzzer_Off ------------------------- */
+void Buzzer_Off(void)
+{
+  GPIOB->BRR = (1 << 8);  // Set PB8 Low
+}
+
+/* -------------------------- motor_control ------------------------ */
+void motor_control(int motorspeedl, int motorspeedr) 
+{
+  if(motorspeedl < 0)
   {
-    TIM2->CCR3 = (left * 10);
-    TIM2->CCR4 = 0;
+    sensor_right (ARR_const*0, -1*ARR_const*motorspeedl);
   }
   else
   {
-    TIM2->CCR3 = 0;
-    TIM2->CCR4 = (-left * 10);
+    sensor_right (ARR_const*motorspeedl, ARR_const*0);
   }
-  
-  if(right >= 0)
+
+  if(motorspeedr < 0)
   {
-    TIM3->CCR3 = (right * 10);
-    TIM3->CCR4 = 0;
+    sensor_left (ARR_const*0, -1*ARR_const*motorspeedr);
   }
   else
   {
-    TIM3->CCR3 = 0;
-    TIM3->CCR4 = (-right * 10);
+    sensor_left (ARR_const*motorspeedr, ARR_const*0);
   }
 }
 
-/* --- READ LINE SENSORS --- */
-int readLineSensors(void)
+/* ----------------------- QTR8_config, QTR8_Read ------------------ */
+void QTR8_config(void)
 {
-  int sumPos      = 0;               // Weighted sum
-  int activeCount = 0;               // Number of sensors active
-  int weights[8]  = {1000,2000,3000,4000,5000,6000,7000,8000};
+  GPIOA->CRL |= (3<<28) | (3<<24) | (3<<20) | (3<<16) | (3<<12) | (3<<8) | (3<<4) | (3<<0);  
+  GPIOA->CRL &= ~(GPIO_CRL_CNF0) & ~(GPIO_CRL_CNF1) & ~(GPIO_CRL_CNF2) & ~(GPIO_CRL_CNF3) & 
+                 ~(GPIO_CRL_CNF4) & ~(GPIO_CRL_CNF5) & ~(GPIO_CRL_CNF6) & ~(GPIO_CRL_CNF7);
+  GPIOA->ODR |= (1 << 7) | (1 << 6)| (1 << 5)| (1 << 4)| (1 << 3)| (1 << 2)| (1 << 1)| (1 << 0); 
+  delay_us(12);
+
+  GPIOA->CRL &= ~(3<<28) & ~(3<<24) & ~(3<<20) & ~(3<<16) & ~(3<<12) & ~(3<<8) & ~(3<<4) & ~(3<<0);
+  GPIOA->CRL |= (2<<30) | (2<<26) | (2<<22) | (2<<18) | (2<<14) | (2<<10) | (2<<6) | (2<<2);
+  delay_ms(6);
+}
+
+int QTR8_Read()
+{
+  QTR8_config();
+  int pos = 0;
+  int var = 0;
+  int active = 0;
   
-  for(int i=0; i<8; i++)
+  if(((GPIOA->IDR & (1<<0)) == (1<<0)))
   {
-    g_lineData[i] = ( (GPIOA->IDR & (1<<i)) ? 1 : 0 );
-    if(g_lineData[i])
+    SensorData = 0x00000001;  
+    pos += 1000;
+    active++;
+    last_end=1;
+  }
+  if(((GPIOA->IDR & (1<<1)) == (1<<1)))
+  {
+    SensorData = 0x00000010;  
+    pos += 2000;
+    active++;
+  } 
+  if(((GPIOA->IDR & (1<<2)) == (1<<2)))
+  {
+    SensorData = 0x00000100;  
+    pos += 3000;
+    active++;
+  }
+  if(((GPIOA->IDR & (1<<3)) == (1<<3)))
+  {
+    SensorData = 0x00001000;  
+    pos += 4000;
+    active++;
+  }
+  if(((GPIOA->IDR & (1<<4)) == (1<<4)))
+  {
+    SensorData = 0x00010000;  
+    pos += 5000;
+    active++;
+  }
+  if(((GPIOA->IDR & (1<<5)) == (1<<5)))
+  {
+    SensorData = 0x00100000;  
+    pos += 6000;
+    active++;
+  }
+  if(((GPIOA->IDR & (1<<6)) == (1<<6)))
+  {
+    SensorData = 0x01000000;  
+    pos += 7000;
+    active++;
+  }
+  if(((GPIOA->IDR & (1<<7)) == (1<<7)))
+  {
+    SensorData = 0x10000000;  
+    pos += 8000;
+    active++;
+    last_end=0;   
+  }
+  
+  data[0] = (GPIOA->IDR & (1<<0));
+  data[1] = (GPIOA->IDR & (1<<1));
+  data[2] = (GPIOA->IDR & (1<<2));
+  data[3] = (GPIOA->IDR & (1<<3));
+  data[4] = (GPIOA->IDR & (1<<4));
+  data[5] = (GPIOA->IDR & (1<<5));
+  data[6] = (GPIOA->IDR & (1<<6));
+  data[7] = (GPIOA->IDR & (1<<7));
+
+  position = pos/((active==0)?1:active);
+  actives = active;
+  varan = var;
+
+  if (actives == 0) last_idle++;
+  else last_idle = 0;
+
+  return pos/((active==0)?1:active);
+}
+
+/* ----------------------------- pwm ------------------------------ */
+void pwm(void)
+{
+  RCC->APB2ENR |= RCC_APB2ENR_IOPBEN | RCC_APB2ENR_AFIOEN;
+  RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;   // enable timer2
+  AFIO->MAPR   |= AFIO_MAPR_TIM2_REMAP_FULLREMAP;
+  
+  TIM2->CCER  |= TIM_CCER_CC4E; // capture/compare 4 enabled
+  TIM2->CCER  |= TIM_CCER_CC3E; // capture/compare 3 enabled
+  TIM2->CR1   |= TIM_CR1_ARPE;  // Auto-reload preload enable
+  TIM2->CCMR2 |= TIM_CCMR2_OC4M_1 | TIM_CCMR2_OC4M_2 | TIM_CCMR2_OC4PE;
+  TIM2->CCMR2 |= TIM_CCMR2_OC3M_1 | TIM_CCMR2_OC3M_2 | TIM_CCMR2_OC3PE;
+
+  // PWM freq = Fclk / PSC / ARR = 72MHz / 72 / 20000 = 50 Hz (for servo style)
+  TIM2->PSC = 72-1;  
+  TIM2->ARR = 40000;
+}
+
+/* ----------------------------- pwm2 ----------------------------- */
+void pwm2(void)
+{
+  RCC->APB2ENR |= RCC_APB2ENR_IOPBEN | RCC_APB2ENR_AFIOEN;
+  RCC->APB1ENR |= RCC_APB1ENR_TIM3EN; // enable timer3
+
+  TIM3->CCER  |= TIM_CCER_CC4E; 
+  TIM3->CCER  |= TIM_CCER_CC3E; 
+  TIM3->CR1   |= TIM_CR1_ARPE; 
+  TIM3->CCMR2 |= TIM_CCMR2_OC4M_1 | TIM_CCMR2_OC4M_2 | TIM_CCMR2_OC4PE; 
+  TIM3->CCMR2 |= TIM_CCMR2_OC3M_1 | TIM_CCMR2_OC3M_2 | TIM_CCMR2_OC3PE; 
+
+  // PWM freq = 72MHz / 72 / 10000 = 100 Hz, for example
+  TIM3->PSC = 72-1; 
+  TIM3->ARR = 1500;
+}
+
+/* --------------------- sensor_left, sensor_right ---------------- */
+void sensor_left (int Cl3,int Cl4)
+{
+  TIM2->CCR4 = Cl4; 
+  TIM2->CCR3 = Cl3; 
+  TIM2->EGR  |= TIM_EGR_UG; 
+  TIM2->CR1  |= TIM_CR1_CEN; 
+}
+
+void sensor_right (int Cr3,int Cr4)
+{
+  TIM3->CCR4 = Cr4; 
+  TIM3->CCR3 = Cr3; 
+  TIM3->EGR  |= TIM_EGR_UG; 
+  TIM3->CR1  |= TIM_CR1_CEN; 
+}
+
+/* ------------------------------ sharp_turn ----------------------- */
+//void sharp_turn(void)
+//{
+//  if (last_idle < 25)
+//  {
+//    if (last_end == 1)
+//    {
+//      motorspeedl = 15;
+//      motorspeedr = -25;
+//      motor_control(motorspeedl, motorspeedr);
+//    }
+//    else if(last_end == 0)
+//    {
+//      motorspeedl = -25;
+//      motorspeedr = 15;
+//      motor_control(motorspeedl, motorspeedr);
+//    }
+//		else;
+//  }
+//  else 
+//  {
+//    if (last_end == 1)
+//    {
+//      motorspeedl = 70;
+//      motorspeedr = -53;
+//    }
+//    else
+//    {
+//      motorspeedl = -53;
+//      motorspeedr = 70;
+//    }
+//  }
+//}
+
+/* -------------------- past_errors, errors_sum -------------------- */
+void past_errors(int error) 
+{
+  for (i = 9; i > 0; i--)
+    errors[i] = errors[i-1];
+  errors[0] = error;
+}
+
+int errors_sum(int index)
+{
+  int sum = 0;
+  for (k = 0; k < index; k++)
+  {
+    sum += errors[k];
+  }
+  return sum;
+}
+
+/* --------------------------- PID_control -------------------------- */
+void PID_control(void)
+{
+  position = QTR8_Read();
+  int error = 3750 - position;
+  past_errors(error);
+
+  P = error;
+  I = errors_sum(5);
+  D = error - lastError;
+
+  lastError = error;
+  
+  motorspeed = (int)(P*Kp + I*Ki + D*Kd);
+
+  motorspeedl = basespeedl + motorspeed;
+  motorspeedr = basespeedr - motorspeed;
+
+  if (motorspeedl > maxspeedl)  motorspeedl = maxspeedl;
+  if (motorspeedr > maxspeedr)  motorspeedr = maxspeedr;
+
+  if (actives == 0)
+  {
+    // If no line is detected
+//    sharp_turn();
+  }
+  else
+  {
+    motor_control(motorspeedl, motorspeedr);
+  }
+}
+
+/* =====================================================================
+   =============== ULTRASONIC (SR04) SENSOR CODE START =================
+   ===================================================================== */
+
+/* Configure PB12 as Output (Trigger), PB13 as Input (Echo) */
+void Ultrasonic_Init(void)
+{
+  // Enable port B clock (already done above, but safe to do again)
+  RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
+
+  // PB12 (TRIG) as Push-Pull Output @ 50MHz
+  if (TRIG_PIN < 8) 
+  {
+    // Configure CRL for PB12
+    GPIOB->CRH &= ~(0xF << ((TRIG_PIN-8)*4));   // clear bits
+    GPIOB->CRH |=  (0x3 << ((TRIG_PIN-8)*4));   // 0x3 = 50 MHz, push-pull
+  }
+  else
+  {
+    // if needed for CRL, else for CRH
+    GPIOB->CRH &= ~(0xF << ((TRIG_PIN-8)*4));
+    GPIOB->CRH |=  (0x3 << ((TRIG_PIN-8)*4));
+  }
+
+  // PB13 (ECHO) as input floating
+  if (ECHO_PIN < 8)
+  {
+    // CRL
+    GPIOB->CRL &= ~(0xF << (ECHO_PIN*4));
+    GPIOB->CRL |=  (0x4 << (ECHO_PIN*4));   // 0x4 = input floating
+  }
+  else
+  {
+    // CRH
+    GPIOB->CRH &= ~(0xF << ((ECHO_PIN-8)*4));
+    GPIOB->CRH |=  (0x4 << ((ECHO_PIN-8)*4));
+  }
+
+  // Make sure Trigger pin is initially low
+  GPIOB->BRR = (1 << TRIG_PIN);
+}
+
+/**
+ * @brief  Returns the measured distance in centimeters using SR04
+ * @note   Uses Timer2->CNT for microsecond timing (already set up).
+ *         Speed of sound ~ 340 m/s -> ~29 us/cm or 58 us/2cm
+ *         Distance (cm) = Pulse_width_in_microseconds / 58
+ */
+float getDistance(void)
+{
+  uint32_t startTime, stopTime;
+  float distance;
+
+  // Send 10us trigger pulse
+  GPIOB->BSRR = (1 << TRIG_PIN);  // TRIG high
+  delay_us(10);
+  GPIOB->BRR  = (1 << TRIG_PIN);  // TRIG low
+
+  // Wait for ECHO to go high
+  TIM2->CNT = 0;
+  while(!(GPIOB->IDR & (1 << ECHO_PIN)))
+  {
+    if (TIM2->CNT > 60000)  // ~60ms timeout
+      return -1; // No echo => out of range or sensor not responding
+  }
+  
+  // ECHO is high, get start
+  TIM2->CNT = 0;
+  while(GPIOB->IDR & (1 << ECHO_PIN))
+  {
+    if (TIM2->CNT > 60000)
+      break;  // Too long => out of max range
+  }
+  stopTime = TIM2->CNT;
+
+  // Convert to centimeters
+  // Typically distance in cm = (time in us) / 58.0
+  distance = (float)stopTime / 58.f;
+
+  return distance;
+}
+
+/* =====================================================================
+   =============== ULTRASONIC (SR04) SENSOR CODE END ===================
+   ===================================================================== */
+
+int main(void)
+{
+  initClockPLL();
+  initGPIO();
+  TIM2Config();  // For microsecond timing (Delay functions)
+  pwm();
+  pwm2();
+
+  /* Initialize Ultrasonic sensor pins (Trigger PB12, Echo PB13) */
+  Ultrasonic_Init();
+	Buzzer_Init();
+	
+  while(1)
+  {
+		    /* ------------------------ Line Follow PID ------------------------ */
+    PID_control();
+    /* ------------------- DISTANCE-BASED SPEED CONTROL ------------------
+       Here we read the distance and modify the base speeds so that the
+       robot tries to keep ~60 cm from the board. You can refine as needed.
+    */
+		
+		   float dist = getDistance(); 
+    if (dist > 0) // valid reading
     {
-      sumPos += weights[i];
-      activeCount++;
-      if(i==0) g_lineEndedLeft = 1;  // If leftmost sensor sees line
-      if(i==7) g_lineEndedLeft = 0;  // If rightmost sensor sees line
+      // Example logic: if far away, speed up, if too close, slow down
+			if (dist < (DESIRED_DISTANCE_CM - 45))
+      {
+        basespeedl = 0;
+        basespeedr = 0;
+				Buzzer_On();
+      }
+			else if (dist < (DESIRED_DISTANCE_CM - 43))
+      {
+        basespeedl = 15;
+        basespeedr = 15;
+				Buzzer_Off();
+      }
+						else if (dist < (DESIRED_DISTANCE_CM - 41))
+      {
+        basespeedl = 16;
+        basespeedr = 16;
+				Buzzer_Off();
+      }
+						else if (dist < (DESIRED_DISTANCE_CM - 39))
+      {
+        basespeedl = 17;
+        basespeedr = 17;
+				Buzzer_Off();
+      }
+						else if (dist < (DESIRED_DISTANCE_CM - 37))
+      {
+        basespeedl = 18;
+        basespeedr = 18;
+				Buzzer_Off();
+      }
+						else if (dist < (DESIRED_DISTANCE_CM - 35))
+      {
+        basespeedl = 19;
+        basespeedr = 19;
+				Buzzer_Off();
+      }
+						else if (dist < (DESIRED_DISTANCE_CM - 33))
+      {
+        basespeedl = 20;
+        basespeedr = 20;
+				Buzzer_Off();
+      }
+			      else if (dist < (DESIRED_DISTANCE_CM - 31))
+      {
+        basespeedl = 22;
+        basespeedr = 22;
+				Buzzer_Off();
+      }
+			      else if (dist < (DESIRED_DISTANCE_CM - 29))
+      {
+        basespeedl = 24;
+        basespeedr = 24;
+				Buzzer_Off();
+      }
+			      else if (dist < (DESIRED_DISTANCE_CM - 25))
+      {
+        basespeedl = 25;
+        basespeedr = 25;
+				Buzzer_Off();
+      }
+			      else if (dist < (DESIRED_DISTANCE_CM - 23))
+      {
+        basespeedl = 26;
+        basespeedr = 26;
+				Buzzer_Off();
+      }
+			 else if (dist < (DESIRED_DISTANCE_CM - 21))
+      {
+        basespeedl = 28;
+        basespeedr = 28;
+				Buzzer_Off();
+      }
+						 else if (dist < (DESIRED_DISTANCE_CM - 19))
+      {
+        basespeedl = 30;
+        basespeedr = 30;
+				Buzzer_Off();
+      }
+						 else if (dist < (DESIRED_DISTANCE_CM - 17))
+      {
+        basespeedl = 31;
+        basespeedr = 31;
+				Buzzer_Off();
+      }
+						 else if (dist < (DESIRED_DISTANCE_CM - 15))
+      {
+        basespeedl = 32;
+        basespeedr = 32;
+				Buzzer_Off();
+      }
+						 else if (dist < (DESIRED_DISTANCE_CM - 13))
+      {
+        basespeedl = 33;
+        basespeedr = 33;
+				Buzzer_Off();
+      }
+			 else if (dist < (DESIRED_DISTANCE_CM - 3))
+      {
+        basespeedl = 34;
+        basespeedr = 34;
+				Buzzer_Off();
+      }
+      else
+      {
+        basespeedl = 35;
+        basespeedr = 35;
+				Buzzer_Off();
+      }
+    }
+    else
+    {
+      // If sensor not reading or out of range, keep default or slow down
+      basespeedl = 40;
+      basespeedr = 40;
+			Buzzer_Off();
     }
   }
-  if(activeCount == 0)
-  {
-    g_lineNoDetectCount++;
-    return -1; // No line
-  }
-  g_lineNoDetectCount=0;
-  return (sumPos / activeCount);
-}
-
-/* --- SHIFT LINE ERROR HISTORY --- */
-void shiftLineErrorHistory(int error)
-{
-  for(int i=9; i>0; i--)
-    g_lineErrorHist[i] = g_lineErrorHist[i-1];
-  g_lineErrorHist[0] = error;
-}
-
-/* --- SUM LINE ERRORS --- */
-int sumLineErrors(int count)
-{
-  int sum=0;
-  for(int i=0; i<count; i++)
-    sum += g_lineErrorHist[i];
-  return sum;
-}
-
-/* --- HANDLE NO LINE DETECTED (SHARP TURN) --- */
-void handleNoLine(void)
-{
-  // If not too long, do smaller spin; else bigger spin
-  if(g_lineNoDetectCount < 25)
-  {
-    if(g_lineEndedLeft == 1) 
-      driveMotors(15, -25);   // Spin left
-    else
-      driveMotors(-25, 15);   // Spin right
-  }
-  else
-  {
-    if(g_lineEndedLeft == 1)
-      driveMotors(70, -53);   // Larger spin left
-    else
-      driveMotors(-53, 70);   // Larger spin right
-  }
-}
-
-/* --- UPDATE LINE PID => OUTPUTS STEERING FOR LEFT AND RIGHT --- */
-void updateLinePID(int *pLeftOut, int *pRightOut)
-{
-  int sensorPos = readLineSensors();        // Read QTR8
-  if(sensorPos < 0)
-  {
-    handleNoLine();                        // If no line, do special maneuver
-    *pLeftOut  = 0;                        // No normal PID in that scenario
-    *pRightOut = 0;
-    return;
-  }
-  // Normal line PID
-  int error = 4500 - sensorPos;            // 4500 is midpoint
-  shiftLineErrorHistory(error);            // Shift array
-  int P = error;                           // Proportional
-  int I = sumLineErrors(5);                // Sum last 5 errors for integral
-  int D = error - g_lineLastError;         // Derivative
-  g_lineLastError = error;                 // Update last error
-  
-  float pidOut = (P*g_lineKp) + (I*g_lineKi) + (D*g_lineKd);
-  
-  *pLeftOut  = (int) pidOut;      // steering for left
-  *pRightOut = -(int) pidOut;     // steering for right
-}
-
-/* --- SHIFT DISTANCE ERROR HISTORY --- */
-void shiftDistErrorHistory(float error)
-{
-  for(int i=9; i>0; i--)
-    g_distanceErrorHist[i] = g_distanceErrorHist[i-1];
-    g_distanceErrorHist[0] = error;
-}
-
-/* --- SUM DISTANCE ERRORS --- */
-float sumDistErrors(int count)
-{
-  float sum=0.0f;
-  for(int i=0; i<count; i++)
-    sum += g_distanceErrorHist[i];
-  return sum;
-}
-
-/* --- UPDATE DISTANCE PID --- */
-float updateDistancePID(void)
-{
-  // Shift history
-  shiftDistErrorHistory(g_distanceError);
-
-  // P, I, D
-  float P = g_distanceError;
-  float I = sumDistErrors(5);  // Sum last 5
-  float D = g_distanceError - g_distanceLastError;
-
-  g_distanceLastError = g_distanceError; // Update last error
-
-  float pidVal = (P * g_distKp) + (I * g_distKi) + (D * g_distKd);
-  return pidVal; 
-}
-
-/* --- ULTRASONIC INIT --- */
-void initUltrasonic(void)
-{
-  GPIOB->ODR &= ~(1<<12); // TRIG=0 initially
-}
-
-/* --- MEASURE DISTANCE (HC-SR04) --- */
-float measureDistance(void)
-{
-  GPIOB->ODR &= ~(1<<12);   // TRIG=0
-  delay_us(2);              // Wait 2 us
-  GPIOB->ODR |= (1<<12);    // TRIG=1
-  delay_us(10);             // High for 10 us
-  GPIOB->ODR &= ~(1<<12);   // TRIG=0
-  
-  while((GPIOB->IDR & (1<<13)) == 0);  // Wait ECHO=1
-  uint32_t start = TIM2->CNT;          // Record start
-  while((GPIOB->IDR & (1<<13)) != 0);  // Wait ECHO=0
-  uint32_t end   = TIM2->CNT;          // Record end
-  
-  uint32_t pulseWidth = (end > start) ? (end - start) : 0;
-  float dist = (float)pulseWidth / 58.0f; // approximate => 1us ~ 58 => 1 cm
-  return dist;
-}
-
-/* --- BUZZER CONTROL --- */
-void buzzerControl(float dist)
-{
-  // Example: beep if near setpoint or if out of range
-  if(dist > 58.0f && dist < 62.0f)
-  {
-    GPIOB->BSRR = (1<<8);     // Buzzer ON
-    delay_ms(100);            // 100 ms beep
-    GPIOB->BSRR = (1<<(8+16));// Buzzer OFF
-  }
-  else if(dist < 40.0f || dist > 80.0f)
-  {
-    GPIOB->BSRR = (1<<8);     // Continuous beep ON
-  }
-  else
-  {
-    GPIOB->BSRR = (1<<(8+16));// Buzzer OFF
-  }
+  return 0;
 }
